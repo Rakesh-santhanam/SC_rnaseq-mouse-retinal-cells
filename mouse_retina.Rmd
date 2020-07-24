@@ -1,0 +1,737 @@
+---
+title: "Mouse retinal cells"
+author: "Rakesh Santhanam"
+output: html_document
+---
+
+# Mouse retinal single cell RNA_seq analysis  
+
+Method used: Drop_seq
+
+Pipeline used to analysize fastq files: zUMIs
+
+```{r Load libraries}
+library(SingleCellExperiment)
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(scales)
+library(cowplot)
+library(RCurl)
+library(biomaRt)
+library(pheatmap)
+library(RColorBrewer)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+```
+
+Import data from zUMIs pipeline output
+```{r}
+data_mouse_retina <-  
+  readRDS("~/sc_rnaseq/drop_seq/zUMIs_output/expression/drop_seq_1.dgecounts.rds")
+
+
+barcode_mouse_retina <- 
+  read_csv("~/sc_rnaseq/drop_seq/zUMIs_output/drop_seq_1kept_barcodes.txt")
+
+head(barcode_mouse_retina)
+```
+  
+Sanity check between barcode kept and colnames of sparse matrix
+```{r}
+length(barcode_mouse_retina$XC) == length(colnames(data_mouse_retina$umicount$exon$all)) ## TRUE
+```
+
+Features names - genes
+```{r}
+gene_names <- 
+  rownames(data_mouse_retina$umicount$exon$all)
+
+gene_names[1:10]
+```
+Rownames are in ensemble id
+```{r}
+rownames(data_mouse_retina$umicount$exon$all)[1:10]
+```
+
+Changing them to external gene name
+
+*gene_names* are in ensembl id, so retriving respective gene names of ensembl id
+
+Check list of available of dataset
+```{r} 
+listMarts() ## list of ensamble version
+
+listEnsembl()
+```
+
+First ensembl_100 is for mart argument in useDatasets function
+
+```{r}
+ensembl_100 <- 
+  useEnsembl("ensembl") ## here using default version 100 because genecode 34 is based on ensemble 100 ```
+
+head(listDatasets(ensembl_100)) ## show list of database avaialble for all species
+## here we are interested in "mmusculus_gene_ensembl" dataset
+```
+Loading mouse ensembl
+```{r}
+ensembl_100_mouse <- 
+  useDataset("mmusculus_gene_ensembl", mart = ensembl_100) ## loading mouse ensamble
+
+```
+List ensembl attributes
+```{r}
+head(listAttributes(ensembl_100_mouse)) ## list all attributes avaialble for ensembl_100_mouse
+head(listFilters(ensembl_100_mouse)) ## list all filters avaialble for ensembl_100_mouse
+
+```
+
+Getting attributes using biomaRT
+```{r}
+annotation_mouse_genes <- 
+  biomaRt::getBM(attributes = c("ensembl_gene_id", "ensembl_gene_id_version",
+                              "ensembl_transcript_id", "ensembl_transcript_id_version",
+                              "external_gene_name"), 
+               filters = c("ensembl_gene_id_version"), ## filters ensemble gene_id_version because it has ENSMUSG00000007050.17 
+               values = gene_names,
+               mart = ensembl_100_mouse) ## multiple transcipt with one gene
+
+#annotation_mouse_genes ## this table has higher number of rows compared to gene names because transcript_id_version (alternative splicing)
+
+names(annotation_mouse_genes)
+
+head(annotation_mouse_genes)
+
+nrow(annotation_mouse_genes)
+
+```
+
+Converting dataframe to tibble for downstream analysis
+```{r}
+annotation_mouse_genes_gene_name <- ## change in to tibble
+  as_tibble(annotation_mouse_genes) %>% 
+  dplyr::select(ensembl_gene_id, ensembl_gene_id_version, external_gene_name) %>% 
+  distinct(ensembl_gene_id_version, .keep_all = T) %>%  ## keeping only ditinct 
+  distinct(external_gene_name, .keep_all = T) ## removing dplicated gene names
+
+annotation_mouse_genes_gene_name
+```
+
+First order and subset based on gene name to assign gene names to ensembl id
+```{r}
+count_matrix_ordered <- 
+  data_mouse_retina$umicount$exon$all[sort(annotation_mouse_genes_gene_name$ensembl_gene_id_version),]
+
+sort(c("ENSMUSG00000001506.10", "ENSMUSG00000000708.14", "ENSMUSG00000000792.2",  "ENSMUSG00000001228.14"))
+
+head(rownames(count_matrix_ordered))
+
+```
+  * In count_matrix_ordered object rows are genes and columns are cells
+
+
+Do same for external gene id
+```{r}
+external_gene_names_ordered <- ## changing to vector
+  annotation_mouse_genes_gene_name %>% 
+  arrange(ensembl_gene_id_version) %>% 
+  dplyr::select(external_gene_name) %>% 
+  unlist(.) %>% 
+  as.vector()
+
+head(external_gene_names_ordered)
+
+```
+
+Sanity check before changing ensembl id to gene names
+```{r}
+which (annotation_mouse_genes_gene_name %>% 
+         arrange(ensembl_gene_id_version) %>% 
+         dplyr::select(ensembl_gene_id_version) %>% 
+         unlist(.) %>% 
+         as.vector() != rownames(count_matrix_ordered)) ## has to be zero
+
+#another sanity check
+matrix_row_names_check <- 
+  annotation_mouse_genes_gene_name %>% 
+  arrange(ensembl_gene_id_version) %>% 
+  dplyr::select(ensembl_gene_id_version, external_gene_name) %>% 
+  slice(1:5) %>% 
+  mutate(matrix_rowname = rownames(count_matrix_ordered)[1:5])
+
+matrix_row_names_check ## everthing is fine
+```
+
+finally assign external gene name to ensembl id 
+```{r}
+rownames(count_matrix_ordered) <- external_gene_names_ordered
+```
+
+Rest of the analysis will be carried out by using Seurat package
+
+Now creating seurat object
+
+keeping seurat object with all genes expressed in >= 3cells and atleast 100 genes
+```{r } 
+seurat_mouse_retina <- 
+  CreateSeuratObject(counts = count_matrix_ordered, 
+                   project = "mouse_retina",
+                   assay = "RNA", 
+                   min.cells =3, 
+                   min.features = 100)
+
+seurat_mouse_retina
+
+class(seurat_mouse_retina)
+
+head(seurat_mouse_retina@meta.data)
+```
+## Quality control
+Calculating number of genes detected per UMI
+```{r}
+ seurat_mouse_retina$log10_genes_perumi <- ## detects few genes expressing higher counts
+  log10(seurat_mouse_retina$nFeature_RNA) / log10(seurat_mouse_retina$nCount_RNA)
+```
+
+Mitochondrial genes to find out dead cell percentage
+```{r}
+mitochondrial_genes <- 
+  annotation_mouse_genes_gene_name$external_gene_name[grep("^mt", annotation_mouse_genes_gene_name$external_gene_name)]
+
+seurat_mouse_retina$mit_ratio <- 
+  PercentageFeatureSet(object = seurat_mouse_retina,pattern = "^mt") ## in percentages
+
+seurat_mouse_retina$mit_ratio <- 
+  seurat_mouse_retina@meta.data$mit_ratio/100 ## back to RA (relative abundance= mt/total features)
+
+head(seurat_mouse_retina$mit_ratio)
+
+length(which(seurat_mouse_retina@meta.data$mit_ratio < 0.1))
+
+nrow(seurat_mouse_retina@meta.data)
+```
+
+Another way to calculate mitochondrial ratio using basic r functions
+```{r}
+mito_ratio <- 
+  Matrix::colSums(seurat_mouse_retina@assays[["RNA"]][mitochondrial_genes])/Matrix::colSums(seurat_mouse_retina@assays[["RNA"]])
+```
+
+Saving file
+```{r}
+#saveRDS(seurat_mouse_retina, "~/sc_rnaseq/drop_seq/r_analysis/seurat_mouse_retina.rds")
+```
+
+
+Quality control violin plot of number of cells, rna counts and mitochondria ratio
+```{r}
+VlnPlot(object = seurat_mouse_retina, 
+        features = c("nFeature_RNA", "nCount_RNA", "mit_ratio"), ncol = 3)
+```
+Total RNA counts (transcripts) per cell density plot
+```{r}
+umi_count_per_cell <- 
+  seurat_mouse_retina@meta.data %>% 
+  ggplot(aes(x=nCount_RNA)) +
+  geom_density(alpha = 0.2, color="#ef8a62", fill="#ef8a62") +
+  scale_x_log10() +
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 5000)+
+  xlab("nUMI")
+
+umi_count_per_cell
+```
+Genes per cell
+```{r}
+genes_per_cell <- 
+  seurat_mouse_retina@meta.data %>% 
+  ggplot(aes(x=nFeature_RNA)) +
+  geom_density(alpha = 0.2, color="#ef8a62", fill="#ef8a62") +
+  scale_x_log10() +
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 2500)+
+  xlab("nGene")
+
+genes_per_cell
+```
+
+Total count and genes detected
+```{r}
+umi_genes_plot <- 
+  seurat_mouse_retina@meta.data %>% 
+  ggplot(aes(x = nCount_RNA, y=nFeature_RNA)) +
+  geom_point(color="#ef8a62")+
+  scale_x_log10() +
+  scale_y_log10()+
+  geom_smooth(method = lm) +
+  theme_classic() +
+  geom_text(x = 2.5, y = 4, label = "Pearson = 0.94")
+
+umi_genes_plot
+
+cor(seurat_mouse_retina@meta.data$nCount_RNA, seurat_mouse_retina@meta.data$nFeature_RNA)
+
+```
+  * correlation id >90- good result
+
+Complexity (log10(counts/genes))
+```{r}
+complexity_plot <- ## detect few genes expressing higher counts
+  seurat_mouse_retina@meta.data %>% 
+  ggplot(aes(x =log10_genes_perumi)) +
+  geom_density(fill="#ef8a62")+
+  theme_classic() +
+  geom_vline(xintercept = 0.87)
+
+complexity_plot
+```
+
+Total counts- mitochondrial plot
+```{r}
+umi_mito_plot <- 
+  seurat_mouse_retina@meta.data %>% 
+    ggplot(aes(x = nCount_RNA, y=mit_ratio)) +
+    geom_point(color="#ef8a62")+
+    scale_x_log10() +
+    #scale_y_log10()+
+    #geom_smooth(method = lm) +
+    theme_classic() +
+    geom_hline(yintercept = 0.2)
+  
+umi_mito_plot
+```
+Filtering based on following criteria
+
+  1. nCount_RNA < 5000
+  2. nFeature_RNA <2500
+  3. log10_genes_perumi > 0.87
+  4. mit_ratio < 0.2
+
+```{r}
+filtered_seurat <- 
+  subset(x =seurat_mouse_retina,
+         subset = (nCount_RNA <5000) & 
+           (nFeature_RNA <2500) & 
+           (log10_genes_perumi >0.87) &
+           (mit_ratio <0.2)) 
+
+#saveRDS(filtered_seurat, "~/sc_rnaseq/drop_seq/r_analysis/filtered_seurat.rds")
+
+```
+
+```{r}
+filtered_seurat <- readRDS("~/sc_rnaseq/drop_seq/r_analysis/filtered_seurat.rds")
+```
+
+Quality control is done but before doing cell clustering, we having to check whether clustering could be influenced of cell cycle differentiation
+  * Downloading cellcycle genes
+  
+Cell cycle scoring
+```{r}
+mouse_cell_cycle_file <- 
+  getURL("https://raw.githubusercontent.com/hbc/tinyatlas/master/cell_cycle/Mus_musculus.csv") 
+
+mouse_cell_cycle_file
+
+mouse_cell_cycle_file_1 <-  ## merging with external gene name
+  read_csv(mouse_cell_cycle_file) %>% 
+  inner_join(., annotation_mouse_genes_gene_name[, c("ensembl_gene_id", "external_gene_name")],
+             by = c("geneID" = "ensembl_gene_id"))
+
+unique(mouse_cell_cycle_file_1$phase)
+```
+
+Selecting mouse_g2m cell cycle genes
+```{r}
+mouse_g2m_genes <- 
+  mouse_cell_cycle_file_1 %>% 
+  filter(phase == "G2/M") %>% 
+  dplyr::select(external_gene_name) %>% 
+  unlist(.) %>% 
+  as.vector()
+```
+
+Selecting mouse_S genes
+```{r}
+mouse_S_genes <- 
+  mouse_cell_cycle_file_1 %>% 
+  filter(phase == "S") %>% 
+  dplyr::select(external_gene_name) %>% 
+  unlist(.) %>% 
+  as.vector()
+```
+Now we have cell cycle genes and before cell cycle clustering, lets to normalization
+
+Normalizing data for cell cycle scoring
+```{r}
+filtered_seurat_log_normalize <- 
+  NormalizeData(filtered_seurat) ## by default lognormalization method
+
+cell_phase_seurat <-  ## this automatically add two more cycle columns in metadata
+  CellCycleScoring(filtered_seurat_log_normalize,
+                   g2m.features = mouse_g2m_genes,
+                   s.features = mouse_S_genes)
+
+head(cell_phase_seurat@meta.data)
+
+cell_phase_seurat
+```
+Finding high variable genes
+```{r}
+cell_phase_seurat <- 
+  FindVariableFeatures(cell_phase_seurat,
+                       selection.method = "vst", 
+                       nfeatures = 2000, 
+                       verbose = F)
+
+cell_phase_seurat ## 2000 variable added to the object
+
+cell_phase_seurat <- ScaleData(cell_phase_seurat) ## scaling data
+
+cell_phase_seurat@assays[["RNA"]][1:10] ## scaled data floating numbers
+```
+
+```{r}
+cell_phase_seurat
+```
+SCT transformation and Cell clustering using UMAP
+```{r}
+
+cell_phase_seurat <- 
+   SCTransform(cell_phase_seurat, vars.to.regress = c("mit_ratio"))
+ 
+cell_phase_seurat ## now sct assay is adding to the object
+
+cell_phase_seurat <- 
+   RunPCA(cell_phase_seurat)
+
+
+cell_phase_seurat <- 
+  RunUMAP(cell_phase_seurat, 
+        dims = 1:40, 
+        reduction = "pca")
+
+cell_phase_seurat ## umap added to the object
+
+DimPlot(cell_phase_seurat, reduction = "umap")
+```
+UAMP plot by cell cycle phase
+```{r}
+cell_cycle_umap_plot <- 
+  DimPlot(cell_phase_seurat,
+        group.by = "Phase")
+
+cell_cycle_umap_plot
+```
+Cell_cycle_umap_plot looks good and no specific clustering by cell cycle phase
+
+Find clusters
+```{r}
+cell_phase_seurat <- 
+  FindNeighbors(object = cell_phase_seurat,
+                dims = 1:40) # using 40 dimensions
+
+cell_phase_seurat
+
+cell_phase_seurat <- 
+  FindClusters(object = cell_phase_seurat,
+                resolution = c(0.4, 0.6, 0.8))
+
+head(cell_phase_seurat@meta.data) ## culsters are added to the figure
+```
+
+Stick with 0.4 resolution because we expect less number of cluster.
+
+For example 6 major cell types expected from mouse retinal data
+```{r}
+Seurat::Idents(object = cell_phase_seurat) <- "SCT_snn_res.0.4"
+
+cell_clusters_plot <- 
+  DimPlot(cell_phase_seurat,
+        reduction = "umap",
+        label = T,
+        label.size = 6)
+
+cell_clusters_plot
+
+# UMAPPlot(cell_phase_seurat) another way to do it- same plot
+```
+
+Cluster based on 0.6 resolution
+```{r}
+Seurat::Idents(object = cell_phase_seurat) <- "SCT_snn_res.0.6"
+
+cell_clusters_plot_0.6 <- 
+  DimPlot(cell_phase_seurat,
+        reduction = "umap",
+        label = T,
+        label.size = 6)
+
+cell_clusters_plot_0.6
+
+UMAPPlot(cell_phase_seurat)
+```
+Number of cluster increased from 17 to 21 by increasing resolution from 0.4 to 0.6
+
+```{r}
+Seurat::Idents(object = cell_phase_seurat) <- "SCT_snn_res.0.4"
+
+```
+
+Save data
+```{r}
+#saveRDS(cell_phase_seurat, "~/sc_rnaseq/drop_seq/r_analysis/cell_phase_seurat.rds")
+```
+
+
+Distribution of cells per cluster
+```{r}
+cells_per_cluster <- 
+  FetchData(cell_phase_seurat,
+            vars = "ident") %>%  ## ident = cluster assignment to respective cell
+  dplyr::count(ident) %>% 
+  tidyr::spread(ident, n)
+
+cells_per_cluster
+```
+
+Another way to do- distribution of cells per cluster
+```{r}
+
+cell_phase_seurat@meta.data %>% 
+  dplyr::select(SCT_snn_res.0.4) %>% 
+  group_by(SCT_snn_res.0.4) %>% 
+  count() %>% 
+  ungroup() %>% 
+  spread(SCT_snn_res.0.4, n)
+
+```
+### Assignment of clusters based on known gene markers
+
+List of markers genes for cell types
+```{r}
+cell_type_markers <- 
+  read_tsv("~/sc_rnaseq/drop_seq/r_analysis/cell_type_markers.csv")
+
+cell_type_markers
+```
+Now assigning clusters by known gene markers
+
+Bipolar cells cluster 8 and 3
+```{r}
+biplor_cells <- 
+  FeaturePlot(cell_phase_seurat, 
+              reduction = "umap", 
+              features = c("Cabp5", "Car10","Grm6", "Vsx2", "Gabrr1"), 
+              order = TRUE,
+              min.cutoff = 'q10', 
+              label = TRUE)
+biplor_cells
+```
+
+Muller_glial_cells - cluster 4
+```{r}
+muller_glial_cells <- 
+  FeaturePlot(cell_phase_seurat, 
+              reduction = "umap", 
+              features = c("Glul", "Rlbp1"), 
+              order = TRUE,
+              min.cutoff = 'q10', 
+              label = TRUE)
+
+muller_glial_cells
+```
+
+Muller glial cells violin plot
+```{r}
+VlnPlot(object = cell_phase_seurat, 
+        features = c("Glul", "Rlbp1"))
+```
+
+Retinal ganglion cell -cluster 5 and 7
+```{r} 
+retinal_ganglian_cell <- 
+  FeaturePlot(cell_phase_seurat, 
+            reduction = "umap", 
+            features = c("Sncg", "Nefl", "Nefm", "Slc17a6"), 
+            order = TRUE,
+            min.cutoff = 'q10', 
+            label = TRUE)
+
+retinal_ganglian_cell
+```
+
+Amarcine cells -cluster 2
+```{r}
+amacrine_cells <- 
+  FeaturePlot(cell_phase_seurat, 
+              reduction = "umap", 
+              features = c("Pax6", "Gad1", "Gad2", "Atp1b1"), 
+              order = TRUE,
+              min.cutoff = 'q10', 
+              label = TRUE)
+
+amacrine_cells
+
+```
+
+Rods cells - big cluster 0,1,6,7,9,10,11,12,13,14,15,16,17
+```{r}
+rod_cells <- 
+  FeaturePlot(cell_phase_seurat, 
+            reduction = "umap", 
+            features = c("Pde6b", "Cnga1", "Rho", "Nr2e3"), 
+            order = TRUE,
+            min.cutoff = 'q10', 
+            label = TRUE)
+rod_cells
+```
+Rod cells violin plot
+```{r}
+VlnPlot(object = cell_phase_seurat, 
+        features = c("Pde6b", "Cnga1", "Rho", "Nr2e3"))
+```
+Unable to find horizontal cell cluster
+```{r}
+horizontal_cell_cluster   <- 
+  FeaturePlot(cell_phase_seurat, 
+            reduction = "umap", 
+            features = c("Lhx1"), 
+            order = TRUE,
+            min.cutoff = 'q10', 
+            label = TRUE)
+
+horizontal_cell_cluster
+```
+
+In general rod cells represented in very big cluster compared to other cell types
+
+These rod cells clusters such as 9,6,10,11 could be sub-polulation and might have separate gene markers
+
+To find out unqiue gene markers for rod cells small clusters, I am going to use FindAllMarkers function from seurat package
+
+```{r}
+sct_markers <- 
+  FindAllMarkers(cell_phase_seurat,
+                 only.pos = T,
+                 logfc.threshold = 0.25)
+```
+
+### Cluster specific markers and could be sub-population
+Cluster 6
+```{r}
+cluster6_markers <- 
+  VlnPlot(object = cell_phase_seurat, 
+        features = c("Gm10800","Gm10801","Gm10717", "Gm21738")) 
+
+cluster6_markers
+```
+
+
+Cluster 9
+```{r}
+cluster9_markers <- 
+  VlnPlot(object = cell_phase_seurat, 
+          features = c("Fasn","Ctc1","E330017L17Rik", "Pclo")) 
+
+cluster9_markers
+```
+
+Cluster 10
+```{r}
+cluster10_markers <- 
+  VlnPlot(object = cell_phase_seurat, 
+          features = c("Pde6h","Opn1sw","Opn1mw", "Gnat2", "Gngt2", "Arr3"))
+
+cluster10_markers
+```
+
+Cluster 11
+```{r}
+cluster11_markers <- 
+  VlnPlot(object = cell_phase_seurat, 
+          features = c("Zfp97","Zfp960","Gm5165"))
+
+cluster11_markers
+```
+
+
+Cluster 12
+```{r}
+cluster12_markers <- 
+  VlnPlot(object = cell_phase_seurat, 
+          features = c("Kcnq1ot1")) +
+  NoLegend()
+cluster12_markers
+```
+
+Cluster 13
+```{r}
+cluster13_markers <- 
+  VlnPlot(object = cell_phase_seurat, 
+          features = c("Opn1sw"))+
+  NoLegend()
+
+cluster13_markers
+```
+
+Cluster 14
+```{r}
+cluster14_markers <- 
+  VlnPlot(object = cell_phase_seurat, 
+          features = c("Rgs5","Sparcl1"))
+
+cluster14_markers
+```
+Cluster specific gene markers should be validated in lab, for now we can assign them as rod cells because of known marker genes
+
+All clusters to respective cell types
+```{r}
+cell_phase_seurat <-  ## renaming seurat cell types
+  RenameIdents(object = cell_phase_seurat, 
+                                  "0" = "Rod cells",
+                                  "1" = "Rod cells",
+                                  "2" = "Amacrine cells",
+                                  "3" = "Bipolar cells",
+                                  "4" = "Muller glia",
+                                  "5" = "Retinal ganglion cells",
+                                  "6" = "Rod cells",
+                                  "7" = "Retinal ganglion cells",
+                                  "8" = "Bipolar cells",
+                                  "9" = "Rod cells",
+                                  "10" = "Rod cells",
+                                  "11" = "Rod cells",
+                                  "12" = "Rod cells",
+                                  "13" = "Rod cells",
+                                  "14" = "Rod cells",
+                                  "15" = "Rod cells",
+                                  "16" = "Rod cells",
+                                  "17" = "Rod cells")
+
+
+Final_plot <- 
+  DimPlot(object = cell_phase_seurat, 
+        reduction = "umap", 
+        label = TRUE,
+        label.size = 3,
+        repel = TRUE)
+
+Final_plot
+```
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
