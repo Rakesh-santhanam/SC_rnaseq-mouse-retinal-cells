@@ -1,0 +1,7 @@
+Cell types	Marker genes	Reference
+Bipolar cells	Cabp5, Car10, Grm6, Vsx2, Gabrr1	Kim et al., 2008 and Park et al., 2017
+Rod cells	Pde6b, Cngal, Rho, Nr2e3	Kim et al., 2008 and Park et al.,  2017
+Retinal Ganliion cells	Sncg, Nefl, Nefm, Slc17a6, Cartpt	Laboissonniere et al., 2019
+Amacrine cells	Pax6, Gad1, Gad2, Atp1b1	Macosko et al., 2015
+muller_glial_cells	Glul, Rlbp1	Laboissonniere et al., 2019
+Horizontal cells	Lhx1, Prox1	Boije et al., 2016
